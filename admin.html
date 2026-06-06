@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Party Protocol - Admin</title>
+  <style>
+    *{box-sizing:border-box} body{margin:0;font-family:Arial,sans-serif;background:#e2e8f0;color:#0f172a;display:flex;min-height:100vh}.side{width:300px;background:#0f172a;color:white;padding:16px;overflow:auto}.main{flex:1;padding:28px;overflow:auto}.cat{width:100%;padding:13px;margin:5px 0;border:0;border-radius:9px;background:#1e293b;color:#cbd5e1;text-align:left;cursor:pointer}.cat.active{background:#38bdf8;color:#0f172a;font-weight:bold}.card{background:white;border-radius:16px;padding:22px;margin:14px 0;box-shadow:0 4px 18px rgba(0,0,0,.08)}input,select,textarea{width:100%;padding:12px;border:1px solid #cbd5e1;border-radius:10px;margin:6px 0;font-size:1rem}textarea{min-height:100px}button{border:0;border-radius:10px;padding:12px 16px;font-weight:800;cursor:pointer;color:white;margin:5px}.green{background:#10b981}.blue{background:#2563eb}.red{background:#ef4444}.orange{background:#f59e0b}.gray{background:#475569}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.q{border-left:5px solid #2563eb;background:#f8fafc;padding:12px;margin:8px 0;border-radius:8px}.muted{color:#64748b}.top{display:flex;gap:10px;flex-wrap:wrap}@media(max-width:800px){body{display:block}.side{width:100%}.grid{grid-template-columns:1fr}}
+  </style>
+</head>
+<body>
+  <aside class="side">
+    <h2>PARTY PROTOCOL</h2>
+    <p class="muted">Panel admina</p>
+    <div id="cats"></div>
+  </aside>
+  <main class="main">
+    <h1 id="title">Wybierz kategorię</h1>
+    <div class="top">
+      <button class="orange" onclick="resetGame()">RESET GRY</button>
+      <button class="blue" onclick="loadData()">ODŚWIEŻ</button>
+      <a href="/tv.html"><button class="green">OTWÓRZ TV</button></a>
+      <a href="/player.html"><button class="gray">OTWÓRZ GRACZA</button></a>
+    </div>
+    <section id="editor" style="display:none">
+      <div class="card">
+        <h2>Dodaj pytanie / zadanie</h2>
+        <label>Treść</label>
+        <textarea id="q"></textarea>
+        <div id="dynamic"></div>
+        <button class="green" onclick="addQuestion()">DODAJ</button>
+      </div>
+      <div class="card">
+        <h2>Pytania w tej kategorii</h2>
+        <div id="list"></div>
+      </div>
+    </section>
+  </main>
+  <script>
+    let config={}, questions=[], current=null;
+    async function loadData(){
+      config = await fetch('/api/config').then(r=>r.json());
+      questions = await fetch('/api/questions').then(r=>r.json());
+      renderCats(); if(current) selectCat(current);
+    }
+    function renderCats(){
+      document.getElementById('cats').innerHTML = Object.entries(config).map(([key,c])=>`<button class="cat ${key===current?'active':''}" onclick="selectCat('${key}')">${esc(c.name)}<br><small>${esc(c.type)} • ${c.time}s • ${c.points} pkt</small></button>`).join('');
+    }
+    function selectCat(key){ current=key; renderCats(); const c=config[key]; document.getElementById('title').textContent=c.name; document.getElementById('editor').style.display='block'; renderDynamic(c.type); renderList(); }
+    function renderDynamic(type){
+      const d=document.getElementById('dynamic');
+      if(type==='abcd') d.innerHTML=`<label>Poprawna odpowiedź</label><input id="answer"><div class="grid"><input id="o1" placeholder="Opcja 1"><input id="o2" placeholder="Opcja 2"><input id="o3" placeholder="Opcja 3"><input id="o4" placeholder="Opcja 4"></div>`;
+      else if(type==='open') d.innerHTML=`<label>Poprawna odpowiedź</label><input id="answer">`;
+      else if(type==='slider') d.innerHTML=`<label>Poprawna dekada</label><input id="answer" placeholder="np. 1960"><div class="grid"><input id="min" placeholder="Min" value="1880"><input id="max" placeholder="Max" value="2020"><input id="step" placeholder="Krok" value="10"></div>`;
+      else d.innerHTML=`<p class="muted">Ten typ rundy nie wymaga poprawnej odpowiedzi. Wpisz tylko treść zadania/pytania.</p>`;
+    }
+    function renderList(){
+      const list = questions.filter(x=>x.category===current);
+      document.getElementById('list').innerHTML = list.length ? list.map(x=>`<div class="q"><b>${esc(x.q)}</b><p class="muted">Odp: ${esc(x.answer || 'brak')} ${x.options?.length?'• Opcje: '+x.options.map(esc).join(', '):''}</p><button class="red" onclick="delQ('${x.id}')">USUŃ</button></div>`).join('') : '<p class="muted">Brak pytań.</p>';
+    }
+    async function addQuestion(){
+      const text=document.getElementById('q').value.trim(); if(!text) return alert('Wpisz treść');
+      const type=config[current].type; const payload={category:current,q:text};
+      if(document.getElementById('answer')) payload.answer=document.getElementById('answer').value.trim();
+      if(type==='abcd') payload.options=['o1','o2','o3','o4'].map(id=>document.getElementById(id).value.trim()).filter(Boolean);
+      if(type==='slider'){ payload.min=Number(document.getElementById('min').value||1880); payload.max=Number(document.getElementById('max').value||2020); payload.step=Number(document.getElementById('step').value||10); }
+      await fetch('/api/questions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+      document.getElementById('q').value=''; await loadData(); selectCat(current);
+    }
+    async function delQ(id){ if(!confirm('Usunąć pytanie?')) return; await fetch('/api/questions/'+id,{method:'DELETE'}); await loadData(); selectCat(current); }
+    async function resetGame(){ if(!confirm('Zresetować całą grę?')) return; await fetch('/api/reset',{method:'POST'}); alert('Zresetowano.'); }
+    function esc(x){return String(x??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));}
+    loadData();
+  </script>
+</body>
+</html>

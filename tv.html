@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+  <meta charset="UTF-8">
+  <title>Party Protocol - TV</title>
+  <style>
+    *{box-sizing:border-box} body{margin:0;font-family:'Segoe UI',Arial,sans-serif;background:#0f172a;color:white;text-align:center;padding:28px;overflow-x:hidden}.panel{background:#1e293b;border:1px solid #334155;border-radius:24px;padding:28px;margin:18px auto;max-width:1200px;box-shadow:0 20px 50px rgba(0,0,0,.3)}h1{font-size:4rem;margin:10px 0;color:#38bdf8}h2{font-size:2.2rem}.muted{color:#94a3b8}.timer{font-size:6rem;font-weight:900;color:#f43f5e;font-variant-numeric:tabular-nums}.btn{border:0;border-radius:14px;padding:18px 34px;margin:10px;color:white;font-size:1.4rem;font-weight:900;cursor:pointer}.green{background:#10b981}.red{background:#ef4444}.blue{background:#2563eb}.orange{background:#f59e0b}.purple{background:#7c3aed}.players{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:14px;margin-top:22px}.player{background:#111827;border:2px solid #334155;border-radius:18px;padding:16px}.leader{border-color:#f59e0b;box-shadow:0 0 20px rgba(245,158,11,.35)}.last{border-color:#ef4444}.score{font-size:2rem;color:#10b981;font-weight:900}.q{font-size:2.8rem;background:#334155;border-radius:20px;padding:34px;margin:20px}.wheel{font-size:4rem;font-weight:900;animation:pulse 1s infinite;color:#f59e0b}.log{font-size:1.4rem;background:#020617;border-left:6px solid #38bdf8;text-align:left;padding:14px 18px;border-radius:10px;margin:8px auto;max-width:1000px}.auction{background:#7f1d1d;border:4px solid #ef4444}.split{display:grid;grid-template-columns:1fr 1fr;gap:18px}.agree{border:3px solid #10b981}.disagree{border:3px solid #ef4444}.big{font-size:5rem}.small{font-size:1rem}@keyframes pulse{0%{transform:scale(1)}50%{transform:scale(1.04)}100%{transform:scale(1)}}
+  </style>
+</head>
+<body>
+  <div id="main"></div>
+  <div id="players" class="players"></div>
+  <script src="/socket.io/socket.io.js"></script>
+  <script>
+    const socket = io();
+    let state = null;
+    socket.on('tvState', s => { state = s; render(); });
+    socket.on('tick', t => { const el = document.getElementById('timer'); if(el) el.textContent = t > 0 ? t : ''; });
+    socket.on('auctionUpdate', bid => { const el = document.getElementById('auc'); if(el) el.textContent = `${bid.amount} pkt - ${bid.player}`; });
+
+    function esc(x){ return String(x ?? '').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c])); }
+    function playersSorted(){ return Object.entries(state?.players||{}).sort((a,b)=>b[1].score-a[1].score); }
+    function timer(){ return `<div id="timer" class="timer">${state.timer||''}</div>`; }
+    function phaseName(){ return {lobby:'LOBBY',secret_intro:'TAJNE ROZKAZY',wheel:'KOŁO FORTUNY',tactical:'POKÓJ TAKTYCZNY',round:'RUNDA',story_guess:'DETEKTYW',debate_vote:'GŁOSOWANIE PO DEBACIE',auction_verify:'WERYFIKACJA',results:'WYNIKI',final_auction:'FINAŁ',final_verify:'WERYFIKACJA FINAŁU',secret_agent_reveal:'TAJNI AGENCI',game_over:'KONIEC GRY'}[state.phase]||state.phase; }
+
+    function render(){ if(!state) return; renderMain(); renderPlayers(); }
+    function renderMain(){
+      const m = document.getElementById('main');
+      if(state.phase === 'lobby') m.innerHTML = `<div class="panel"><h1>PARTY PROTOCOL</h1><h2>Wejdźcie telefonem na:</h2><div class="q">${location.origin}/player.html</div><p class="muted">Gracze dołączają przez telefony. Gdy wszyscy są gotowi, startujemy.</p><button class="btn green" onclick="socket.emit('tvStartGame')">START GRY</button></div>`;
+      else if(state.phase === 'secret_intro') m.innerHTML = `<div class="panel"><h1>TAJNE ROZKAZY</h1>${timer()}<p>Każdy dostał prywatną misję. Udawajcie, że nic się nie stało.</p></div>`;
+      else if(state.phase === 'wheel') m.innerHTML = `<div class="panel"><h1>KOŁO FORTUNY</h1>${timer()}<div class="wheel">${esc(catName())}</div><p class="muted">Runda ${state.roundNumber}/${state.maxRounds}</p></div>`;
+      else if(state.phase === 'tactical') m.innerHTML = `<div class="panel"><h1>POKÓJ TAKTYCZNY</h1>${timer()}<h2>Nadchodzi: <span style="color:#f59e0b">${esc(catName())}</span></h2><p>Boosty, tarcze i sabotaże. Tu kończą się przyjaźnie.</p>${messages()}</div>`;
+      else if(state.phase === 'round') m.innerHTML = roundHtml();
+      else if(state.phase === 'story_guess') m.innerHTML = storyHtml();
+      else if(state.phase === 'debate_vote') m.innerHTML = `<div class="panel"><h1>GŁOSOWANIE PO DEBACIE</h1>${timer()}<p>Wybierzcie na telefonach najlepszego przeciwnika w dyskusji.</p></div>`;
+      else if(state.phase === 'auction_verify') m.innerHTML = auctionVerifyHtml();
+      else if(state.phase === 'results') m.innerHTML = `<div class="panel"><h1>KONIEC RUNDY</h1>${timer()}${messages()}</div>`;
+      else if(state.phase === 'final_auction') m.innerHTML = `<div class="panel"><h1>FINAŁ FINAŁÓW</h1>${timer()}<div class="q">${esc(state.currentQuestion?.q)}</div><h2>Najwyższa deklaracja: ${finalLeader()}</h2><p class="muted">Sukces: +700 pkt. Porażka: połowa punktów przepada.</p></div>`;
+      else if(state.phase === 'final_verify') m.innerHTML = finalVerifyHtml();
+      else if(state.phase === 'secret_agent_reveal') m.innerHTML = secretRevealHtml();
+      else if(state.phase === 'game_over') m.innerHTML = gameOverHtml();
+      else m.innerHTML = `<div class="panel"><h1>${esc(phaseName())}</h1></div>`;
+    }
+    function catName(){ const map = {quick:'Szybki Strzał',social:'Sąd Społeczny',open:'Inżynieria i Kalkulacje',globetrotter:'Globtroter',auction:'Licytacja w Dół',timeline:'Historyczna Oś Czasu',illusion:'Iluzja Optyczna',detective:'Detektyw Zbiegowisk',biology:'Biologia i Ciało',debate:'Loża Szyderców',sidequest:'Side Quest',final:'Finał Finałów'}; return map[state.currentCategory] || state.currentCategory || ''; }
+    function messages(){ return (state.tactical?.roundMessages||[]).slice(-4).map(x=>`<div class="log">${esc(x)}</div>`).join(''); }
+    function roundHtml(){
+      const q = state.currentQuestion || {};
+      let extra = '';
+      if(state.currentType === 'auction') extra = `<div class="panel auction"><h2>NAJNIŻSZA OFERTA</h2><div id="auc" class="big">${state.auction?.lowestBid?.amount || 100} pkt - ${esc(state.auction?.lowestBid?.player || 'Brak licytacji')}</div></div>`;
+      if(state.currentType === 'debate') extra = debateSplit();
+      return `<div class="panel"><h1>${esc(catName())}</h1>${timer()}<div class="q">${esc(q.q)}</div>${extra}</div>`;
+    }
+    function debateSplit(){
+      const agree=[], disagree=[];
+      Object.entries(state.submissions||{}).forEach(([id,s])=>{ const p=state.players[id]; if(!p)return; (s.answer==='agree'?agree:disagree).push(p.name); });
+      return `<div class="split"><div class="panel agree"><h2>ZGADZAM SIĘ</h2>${agree.map(esc).join('<br>')||'<span class="muted">Jeszcze nikt</span>'}</div><div class="panel disagree"><h2>NIE ZGADZAM SIĘ</h2>${disagree.map(esc).join('<br>')||'<span class="muted">Jeszcze nikt</span>'}</div></div>`;
+    }
+    function storyHtml(){ const s = state.storyPool?.[state.currentStoryIndex]; return `<div class="panel"><h1>DETEKTYW ZBIEGOWISK</h1>${timer()}<h2>Kto to napisał?</h2><div class="q">${esc(s?.text || '')}</div></div>`; }
+    function auctionVerifyHtml(){ const b=state.auction?.lowestBid; return `<div class="panel auction"><h1>WERYFIKACJA WYZWANIA</h1><h2>${esc(b?.player || 'Brak chętnego')}</h2><div class="big">${b?.amount || 0} pkt</div><button class="btn green" onclick="socket.emit('tvAuctionResult', true)">ZALICZONE</button><button class="btn red" onclick="socket.emit('tvAuctionResult', false)">OBLANE</button></div>`; }
+    function finalLeader(){ const id=state.finalBid?.leaderId; return id && state.players[id] ? `${esc(state.players[id].name)} — ${state.finalBid.amount}` : 'brak'; }
+    function finalVerifyHtml(){ return `<div class="panel"><h1>WERYFIKACJA FINAŁU</h1><h2>${finalLeader()}</h2><button class="btn green" onclick="socket.emit('tvFinalResult', true)">DAŁ RADĘ</button><button class="btn red" onclick="socket.emit('tvFinalResult', false)">POLEGŁ</button></div>`; }
+    function secretRevealHtml(){
+      const cards = playersSorted().map(([id,p])=>`<div class="panel"><h2>${esc(p.name)}</h2><p class="q small">${esc(p.secretMission || '')}</p><button class="btn green" onclick="socket.emit('tvSecretResult',{playerId:'${id}',success:true})">WYKONANE +500</button><button class="btn red" onclick="socket.emit('tvSecretResult',{playerId:'${id}',success:false})">NIE WYKONANE</button></div>`).join('');
+      return `<div class="panel"><h1>ROZLICZENIE TAJNYCH AGENTÓW</h1><p>Grupa decyduje, kto wykonał misję.</p><button class="btn orange" onclick="socket.emit('tvGameOver')">ZAKOŃCZ GRĘ</button></div>${cards}`;
+    }
+    function gameOverHtml(){ const top = playersSorted()[0]; return `<div class="panel"><h1>ZWYCIĘZCA</h1><div class="big">${top?esc(top[1].name):'Brak'}</div><h2>${top?top[1].score:0} pkt</h2><button class="btn blue" onclick="location.reload()">ODŚWIEŻ</button></div>`; }
+    function renderPlayers(){
+      const sorted = playersSorted(); const lastIndex = sorted.length-1;
+      document.getElementById('players').innerHTML = sorted.map(([id,p],i)=>`<div class="player ${i===0?'leader':''} ${i===lastIndex&&i>0?'last':''}"><h3>${i+1}. ${esc(p.name)} ${p.boostActive?'🔥':''} ${p.blockedThisRound?'🔒':''}</h3><div class="score">${p.score}</div><div class="muted small">${p.connected?'online':'offline'}</div></div>`).join('');
+    }
+  </script>
+</body>
+</html>

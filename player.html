@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Party Protocol - Gracz</title>
+  <style>
+    *{box-sizing:border-box} body{margin:0;font-family:Arial,sans-serif;background:#0f172a;color:#fff;text-align:center;padding:18px}.screen{display:none}.show{display:block}.card{background:#1e293b;border:1px solid #334155;border-radius:18px;padding:18px;margin:14px 0;box-shadow:0 10px 30px rgba(0,0,0,.25)}h1,h2,h3{margin:10px 0}.muted{color:#94a3b8}.timer{font-size:4rem;font-weight:900;color:#38bdf8}.btn{width:100%;border:0;border-radius:14px;color:#fff;padding:18px;margin:8px 0;font-size:1.1rem;font-weight:800;cursor:pointer}.btn:active{transform:scale(.98)}.green{background:#10b981}.blue{background:#2563eb}.orange{background:#f59e0b}.red{background:#ef4444}.gray{background:#334155}.purple{background:#7c3aed}input,textarea,select{width:100%;padding:16px;border-radius:12px;border:2px solid #38bdf8;background:#0f172a;color:white;font-size:1.1rem;margin:8px 0}textarea{min-height:120px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}.pill{display:inline-block;padding:6px 10px;border-radius:999px;background:#334155;margin:4px}.flashbang{filter:blur(5px);pointer-events:none}.small{font-size:.9rem}.secret{border:2px dashed #f59e0b;background:#29200f}.disabled{opacity:.45;pointer-events:none}
+  </style>
+</head>
+<body>
+  <div id="join" class="screen show card">
+    <h1>PARTY PROTOCOL</h1>
+    <p class="muted">Wpisz imię. Telefon zostaje Twoim kontrolerem.</p>
+    <input id="name" placeholder="Twoje imię">
+    <button class="btn green" onclick="joinGame()">DOŁĄCZ DO GRY</button>
+  </div>
+
+  <div id="app" class="screen">
+    <div id="timer" class="timer"></div>
+    <div id="content"></div>
+  </div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script>
+    const socket = io();
+    let myId = null;
+    let state = null;
+    let joined = false;
+    let lastPhase = '';
+
+    socket.on('connect', () => myId = socket.id);
+    socket.on('tick', t => { const el = document.getElementById('timer'); el.textContent = t > 0 ? t : ''; });
+    socket.on('updateState', s => { state = s; render(); });
+
+    function joinGame(){
+      const name = document.getElementById('name').value.trim();
+      if(!name) return alert('Wpisz imię');
+      joined = true;
+      socket.emit('joinGame', name);
+      document.getElementById('join').classList.remove('show');
+      document.getElementById('app').classList.add('show');
+    }
+
+    function me(){ return state?.players?.[myId]; }
+    function playerButtons(excludeMe=true){
+      return Object.entries(state.players||{}).filter(([id,p]) => !excludeMe || id !== myId).map(([id,p]) => `<button class="btn gray" onclick="selectTarget('${id}')">${esc(p.name)} <span class="muted">${p.score} pkt</span></button>`).join('') || '<p class="muted">Brak innych graczy.</p>';
+    }
+    function esc(x){ return String(x ?? '').replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c])); }
+
+    function render(){
+      if(!joined || !state) return;
+      const p = me(); if(!p) return;
+      const content = document.getElementById('content');
+      document.body.classList.toggle('flashbang', !!p.flashbangThisRound && state.phase === 'round');
+      if(lastPhase !== state.phase){ lastPhase = state.phase; window.scrollTo(0,0); }
+
+      if(p.blockedThisRound && state.phase === 'round'){
+        content.innerHTML = `<div class="card red"><h2>ZABLOKOWANO CIĘ</h2><p>Ktoś użył Kłódki. Patrz na TV i przemyśl swoje relacje.</p></div>`; return;
+      }
+
+      if(state.phase === 'lobby') content.innerHTML = lobbyHtml(p);
+      else if(state.phase === 'secret_intro') content.innerHTML = secretHtml(p);
+      else if(state.phase === 'wheel') content.innerHTML = waitHtml('Koło Fortuny się kręci', 'Patrz na TV. Zaraz poznamy kategorię.');
+      else if(state.phase === 'tactical') content.innerHTML = tacticalHtml(p);
+      else if(state.phase === 'round') content.innerHTML = roundHtml(p);
+      else if(state.phase === 'story_guess') content.innerHTML = storyGuessHtml(p);
+      else if(state.phase === 'debate_vote') content.innerHTML = debateVoteHtml(p);
+      else if(state.phase === 'auction_verify') content.innerHTML = waitHtml('Weryfikacja wyzwania', 'TV decyduje, czy desperat dał radę.');
+      else if(state.phase === 'results') content.innerHTML = resultsHtml(p);
+      else if(state.phase === 'final_auction') content.innerHTML = finalBidHtml(p);
+      else if(state.phase === 'final_verify') content.innerHTML = waitHtml('Finał na TV', 'Zwycięzca licytacji musi teraz udowodnić swoją wiedzę.');
+      else if(state.phase === 'secret_agent_reveal') content.innerHTML = waitHtml('Rozliczenie Tajnych Agentów', 'Patrz na TV i głosujcie uczciwie. Albo przynajmniej zabawnie.');
+      else if(state.phase === 'game_over') content.innerHTML = resultsHtml(p, true);
+      else content.innerHTML = waitHtml('Czekaj', 'System coś kombinuje.');
+    }
+
+    function lobbyHtml(p){ return `<div class="card"><h2>Jesteś w lobby</h2><p class="muted">${esc(p.name)} • ${p.score} pkt</p><p>Patrz na TV i czekaj na start.</p></div>`; }
+    function secretHtml(p){ return `<div class="card secret"><h2>TAJNY ROZKAZ</h2><p>${esc(p.secretMission)}</p><p class="muted small">Nie pokazuj tego innym. Na końcu grupa oceni, czy misja została wykonana.</p></div>`; }
+    function waitHtml(title, msg){ return `<div class="card"><h2>${esc(title)}</h2><p class="muted">${esc(msg)}</p></div>`; }
+
+    function tacticalHtml(p){
+      const inv = p.inventory || {};
+      const targets = Object.entries(state.players||{}).filter(([id]) => id !== myId);
+      const targetSelect = `<select id="target">${targets.map(([id,tp])=>`<option value="${id}">${esc(tp.name)}</option>`).join('')}</select>`;
+      return `<div class="card"><h2>POKÓJ TAKTYCZNY</h2><p class="muted">Kategoria: ${esc(state.currentQuestion?.category || '')}</p>
+        <button class="btn orange ${inv.boost<=0?'disabled':''}" onclick="useItem('boost')">BOOST x2 (${inv.boost||0})</button>
+        <button class="btn blue ${inv.shield<=0?'disabled':''}" onclick="useItem('shield')">TARCZA (${inv.shield||0})</button>
+        <div class="card"><h3>Sabotaż</h3>${targetSelect}
+          <button class="btn red ${inv.lock<=0?'disabled':''}" onclick="useItem('lock', document.getElementById('target').value)">KŁÓDKA (${inv.lock||0})</button>
+          <button class="btn purple ${inv.flashbang<=0?'disabled':''}" onclick="useItem('flashbang', document.getElementById('target').value)">FLASHBANG (${inv.flashbang||0})</button>
+        </div></div>`;
+    }
+    function useItem(item, targetId=null){ socket.emit('useItem', {item, targetId}); }
+
+    function roundHtml(p){
+      if(p.answered && state.currentType !== 'auction') return waitHtml('Odpowiedź wysłana', 'Teraz patrz na TV i oceniaj innych w myślach.');
+      const q = state.currentQuestion || {};
+      if(state.currentType === 'abcd') return `<div class="card"><h2>${esc(q.q)}</h2>${(q.options||[]).map(o=>`<button class="btn gray" onclick="sendAnswer('${escAttr(o)}')">${esc(o)}</button>`).join('')}</div>`;
+      if(state.currentType === 'open' || state.currentType === 'story') return `<div class="card"><h2>${esc(q.q)}</h2><textarea id="ans" placeholder="Wpisz odpowiedź"></textarea><button class="btn green" onclick="sendAnswer(document.getElementById('ans').value)">WYŚLIJ</button></div>`;
+      if(state.currentType === 'slider') return `<div class="card"><h2>${esc(q.q)}</h2><input id="slider" type="range" min="${q.min||1880}" max="${q.max||2020}" step="${q.step||10}" value="1960" oninput="document.getElementById('sv').textContent=this.value"><h1 id="sv">1960</h1><button class="btn green" onclick="sendAnswer(document.getElementById('slider').value)">ZATWIERDŹ</button></div>`;
+      if(state.currentType === 'vote') return `<div class="card"><h2>${esc(q.q)}</h2>${Object.entries(state.players||{}).filter(([id])=>id!==myId).map(([id,tp])=>`<button class="btn gray" onclick="vote('${id}')">${esc(tp.name)}</button>`).join('')}</div>`;
+      if(state.currentType === 'auction') return `<div class="card"><h2>${esc(q.q)}</h2><p>Najniższa oferta: <b>${state.auction?.lowestBid?.amount || 100} pkt</b></p><input id="bid" type="number" placeholder="Podaj niższą ofertę"><button class="btn red" onclick="sendAnswer(document.getElementById('bid').value);document.getElementById('bid').value=''">PRZEBIJ W DÓŁ</button></div>`;
+      if(state.currentType === 'debate') return `<div class="card"><h2>${esc(q.q)}</h2><button class="btn green" onclick="sendAnswer('agree')">ZGADZAM SIĘ</button><button class="btn red" onclick="sendAnswer('disagree')">NIE ZGADZAM SIĘ</button><p class="muted">Po wyborze broń swojej frakcji na głos.</p></div>`;
+      return waitHtml('Runda', 'Nieobsługiwany typ rundy.');
+    }
+
+    function storyGuessHtml(){
+      const story = state.storyPool?.[state.currentStoryIndex];
+      return `<div class="card"><h2>Kto to napisał?</h2><p class="muted">${esc(story?.text || '')}</p>${Object.entries(state.players||{}).map(([id,p])=>`<button class="btn gray" onclick="sendAnswer('${id}')">${esc(p.name)}</button>`).join('')}</div>`;
+    }
+    function debateVoteHtml(){ return `<div class="card"><h2>Kto z przeciwnej strony miał najlepszy argument?</h2>${Object.entries(state.players||{}).filter(([id])=>id!==myId).map(([id,p])=>`<button class="btn gray" onclick="sendAnswer('${id}')">${esc(p.name)}</button>`).join('')}</div>`; }
+    function resultsHtml(p, over=false){ return `<div class="card"><h2>${over?'KONIEC GRY':'Koniec rundy'}</h2><p>Twój wynik: <b>${p.score} pkt</b></p><p class="muted">Patrz na TV.</p></div>`; }
+    function finalBidHtml(){ return `<div class="card"><h2>OSTATECZNA LICYTACJA</h2><p>${esc(state.currentQuestion?.q)}</p><input id="fbid" type="number" placeholder="Ile elementów wymienisz?"><button class="btn orange" onclick="socket.emit('submitFinalBid', document.getElementById('fbid').value)">LICYTUJ</button><p class="muted">Najwyższa deklaracja wygrywa, ale porażka boli.</p></div>`; }
+
+    function sendAnswer(ans){ if(String(ans).trim()) socket.emit('submitAnswer', ans); }
+    function vote(id){ socket.emit('submitVote', id); }
+    function selectTarget(id){ document.getElementById('target').value = id; }
+    function escAttr(x){ return String(x).replace(/'/g, '&#39;').replace(/"/g,'&quot;'); }
+  </script>
+</body>
+</html>
