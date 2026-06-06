@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Party Protocol - Admin</title>
+  <style>
+    *{box-sizing:border-box}body{margin:0;background:#e2e8f0;color:#0f172a;font-family:Segoe UI,Arial,sans-serif}.layout{display:grid;grid-template-columns:320px 1fr;min-height:100vh}.side{background:#0f172a;color:white;padding:18px;overflow:auto}.main{padding:24px;overflow:auto}.card{background:white;border-radius:18px;padding:20px;margin-bottom:18px;box-shadow:0 8px 25px rgba(15,23,42,.08)}h1,h2,h3{margin-top:0}.btn{border:0;border-radius:12px;padding:12px 16px;margin:5px;color:white;font-weight:900;cursor:pointer}.green{background:#10b981}.red{background:#ef4444}.blue{background:#2563eb}.orange{background:#f59e0b}.purple{background:#7c3aed}.gray{background:#475569}.btn.full{width:100%;display:block;margin:8px 0}input,select,textarea{width:100%;padding:12px;border:1px solid #cbd5e1;border-radius:10px;margin:6px 0;font-size:1rem}textarea{min-height:90px}.player{display:grid;grid-template-columns:1fr 90px 120px 90px;gap:8px;align-items:center;border-bottom:1px solid #e2e8f0;padding:10px 0}.muted{color:#64748b}.pill{display:inline-block;background:#e2e8f0;border-radius:999px;padding:6px 10px;margin:3px}.danger{border:2px solid #ef4444}.qitem{border-left:5px solid #2563eb;padding:12px;background:#f8fafc;border-radius:8px;margin:8px 0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px}.log{background:#020617;color:white;border-radius:10px;padding:10px;margin:6px 0}.small{font-size:.9rem}@media(max-width:850px){.layout{grid-template-columns:1fr}.player{grid-template-columns:1fr}}
+  </style>
+</head>
+<body>
+  <div class="layout">
+    <aside class="side">
+      <h2>PARTY PROTOCOL</h2>
+      <p>Panel admina</p>
+      <label>Pokój</label>
+      <input id="roomInput" style="text-transform:uppercase" maxlength="24">
+      <button class="btn blue full" onclick="changeRoom()">PRZEJDŹ DO POKOJU</button>
+      <hr>
+      <a id="tvLink" class="btn green full" style="text-decoration:none;text-align:center" target="_blank">OTWÓRZ TV</a>
+      <a id="playerLink" class="btn gray full" style="text-decoration:none;text-align:center" target="_blank">OTWÓRZ GRACZA</a>
+      <hr>
+      <button class="btn green full" onclick="socket.emit('adminStartGame')">START</button>
+      <button class="btn orange full" onclick="socket.emit('adminPause')">PAUZA</button>
+      <button class="btn blue full" onclick="socket.emit('adminResume')">WZNÓW</button>
+      <button class="btn purple full" onclick="socket.emit('adminNextRound')">WYMUSZ KOLEJNĄ RUNDĘ</button>
+      <button class="btn red full" onclick="resetGame(true)">RESET Z GRACZAMI</button>
+      <button class="btn red full danger" onclick="resetGame(false)">RESET CAŁKOWITY</button>
+    </aside>
+    <main class="main">
+      <div id="stateBox" class="card"></div>
+      <div class="grid">
+        <section class="card">
+          <h2>Ustawienia gry</h2>
+          <label>Liczba rund przed finałem</label>
+          <input id="maxRounds" type="number" min="1" value="10">
+          <button class="btn blue" onclick="socket.emit('adminSetMaxRounds',document.getElementById('maxRounds').value)">ZAPISZ</button>
+          <label>Wymuś następną kategorię</label>
+          <select id="forceCategory"></select>
+          <button class="btn purple" onclick="socket.emit('adminForceCategory',document.getElementById('forceCategory').value)">USTAW NA KOLEJNĄ RUNDĘ</button>
+        </section>
+        <section class="card">
+          <h2>Linki</h2>
+          <p class="muted">Link dla graczy:</p>
+          <input id="playerUrl" readonly>
+          <p class="muted">TV:</p>
+          <input id="tvUrl" readonly>
+        </section>
+      </div>
+      <section class="card">
+        <h2>Gracze</h2>
+        <div id="players"></div>
+      </section>
+      <section class="card">
+        <h2>Dodaj pytanie / zadanie</h2>
+        <div class="grid">
+          <div><label>Kategoria</label><select id="qCategory"></select></div>
+          <div><label>Odpowiedź poprawna</label><input id="qAnswer" placeholder="dla ABCD/open/slider"></div>
+        </div>
+        <label>Treść</label><textarea id="qText" placeholder="Wpisz pytanie albo zadanie"></textarea>
+        <label>Opcje ABCD, oddzielone znakiem |</label><input id="qOptions" placeholder="Opcja 1 | Opcja 2 | Opcja 3 | Opcja 4">
+        <button class="btn green" onclick="addQuestion()">DODAJ</button>
+      </section>
+      <section class="card">
+        <h2>Baza pytań</h2>
+        <div id="questions"></div>
+      </section>
+      <section class="card">
+        <h2>Logi / komentarze</h2>
+        <div id="logs"></div>
+      </section>
+    </main>
+  </div>
+  <script src="/socket.io/socket.io.js"></script>
+  <script>
+    const params = new URLSearchParams(location.search);
+    let room = clean(params.get('room') || 'MAIN');
+    document.getElementById('roomInput').value = room;
+    let socket = null, state = null, config = {}, questions = [];
+    function clean(v){ return String(v||'MAIN').toUpperCase().replace(/[^A-Z0-9_-]/g,'').slice(0,24) || 'MAIN'; }
+    function esc(x){ return String(x ?? '').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c])); }
+    function connect(){ socket = io({ query: { room, role: 'admin' } }); socket.on('adminState', s=>{ state=s; renderState(); }); socket.on('tick', t=>{ if(state){state.timer=t; renderStateBox();} }); }
+    async function loadData(){ config = await fetch('/api/config').then(r=>r.json()); questions = await fetch('/api/questions').then(r=>r.json()); renderConfig(); renderQuestions(); }
+    function changeRoom(){ const r=clean(document.getElementById('roomInput').value); location.href=`/admin.html?room=${encodeURIComponent(r)}`; }
+    function updateLinks(){ const tv=`${location.origin}/tv.html?room=${encodeURIComponent(room)}`; const player=`${location.origin}/player.html?room=${encodeURIComponent(room)}`; tvLink.href=tv; playerLink.href=player; tvUrl.value=tv; playerUrl.value=player; }
+    function renderConfig(){ const opts=Object.entries(config).map(([k,c])=>`<option value="${k}">${esc(c.name)} — ${esc(c.type)}</option>`).join(''); qCategory.innerHTML=opts; forceCategory.innerHTML=opts; }
+    function renderState(){ renderStateBox(); renderPlayers(); renderLogs(); }
+    function renderStateBox(){ if(!state)return; stateBox.innerHTML=`<h1>Pokój ${esc(room)}</h1><p><span class="pill">Faza: <b>${esc(state.phase)}</b></span><span class="pill">Timer: <b>${state.timer}</b></span><span class="pill">Runda: <b>${state.roundNumber}/${state.maxRounds}</b></span><span class="pill">${state.paused?'PAUZA':'AKTYWNA'}</span></p><p>Kategoria: <b>${esc(config[state.currentCategory]?.name || state.currentCategory || '-')}</b></p><p class="muted">Wymuszona następna kategoria: ${esc(config[state.forcedNextCategory]?.name || state.forcedNextCategory || 'brak')}</p>`; maxRounds.value=state.maxRounds||10; }
+    function renderPlayers(){ const entries=Object.entries(state?.players||{}).sort((a,b)=>b[1].score-a[1].score); players.innerHTML = entries.length ? entries.map(([id,p])=>`<div class="player"><div><b>${esc(p.name)}</b><div class="muted small">${p.connected?'online':'offline'} | Misja: ${esc(p.secretMission||'')}</div></div><input id="score-${id}" type="number" value="${p.score}"><div><button class="btn blue" onclick="setScore('${id}')">USTAW</button><button class="btn orange" onclick="addPoints('${id}',100)">+100</button><button class="btn gray" onclick="addPoints('${id}',-100)">-100</button></div><button class="btn red" onclick="kick('${id}')">USUŃ</button></div>`).join('') : '<p class="muted">Brak graczy.</p>'; }
+    function renderLogs(){ const logsArr=(state?.logs||[]).slice(-20).reverse(); logs.innerHTML=logsArr.map(l=>`<div class="log">${new Date(l.at).toLocaleTimeString()} — ${esc(l.line)}</div>`).join('') || '<p class="muted">Brak logów.</p>'; }
+    function setScore(id){ socket.emit('adminSetScore',{playerId:id,score:document.getElementById(`score-${id}`).value}); }
+    function addPoints(id,delta){ socket.emit('adminAddPoints',{playerId:id,delta}); }
+    function kick(id){ if(confirm('Usunąć gracza?')) socket.emit('adminKickPlayer',id); }
+    function resetGame(keepPlayers){ if(confirm(keepPlayers?'Zresetować grę, ale zostawić graczy?':'Zresetować wszystko razem z graczami?')) socket.emit('adminResetGame',{keepPlayers}); }
+    async function addQuestion(){ const category=qCategory.value; const q=qText.value.trim(); if(!q)return alert('Wpisz treść.'); const answer=qAnswer.value.trim(); const options=qOptions.value.split('|').map(x=>x.trim()).filter(Boolean); await fetch('/api/questions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({category,q,answer,options})}); qText.value=''; qAnswer.value=''; qOptions.value=''; await loadData(); }
+    async function delQuestion(id){ if(!confirm('Usunąć pytanie?'))return; await fetch(`/api/questions/${id}`,{method:'DELETE'}); await loadData(); }
+    function renderQuestions(){ questions.innerHTML = questions.map(q=>`<div class="qitem"><b>${esc(config[q.category]?.name || q.category)}</b><p>${esc(q.q)}</p><p class="muted">Odp: ${esc(q.answer||'-')} ${q.options?.length?' | Opcje: '+esc(q.options.join(', ')):''}</p><button class="btn red" onclick="delQuestion('${q.id}')">USUŃ</button></div>`).join(''); }
+    updateLinks(); connect(); loadData();
+  </script>
+</body>
+</html>
