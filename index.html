@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Party Protocol</title>
+  <style>
+    *{box-sizing:border-box}body{margin:0;min-height:100vh;background:#0f172a;color:#fff;font-family:Segoe UI,Arial,sans-serif;display:flex;align-items:center;justify-content:center;padding:24px}.card{max-width:850px;background:#1e293b;border:1px solid #334155;border-radius:28px;padding:34px;text-align:center;box-shadow:0 25px 70px rgba(0,0,0,.35)}h1{font-size:3.2rem;color:#38bdf8;margin:.2em 0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:14px;margin-top:22px}.btn{display:block;text-decoration:none;color:white;background:#2563eb;padding:18px 20px;border-radius:16px;font-weight:900;font-size:1.2rem}.green{background:#10b981}.orange{background:#f59e0b}.purple{background:#7c3aed}input{width:100%;padding:18px;border-radius:14px;border:2px solid #38bdf8;background:#020617;color:white;text-align:center;font-size:1.4rem;text-transform:uppercase}.muted{color:#94a3b8}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>PARTY PROTOCOL</h1>
+    <p class="muted">Wpisz kod pokoju. Ten sam kod musi być na TV, telefonach i w panelu admina.</p>
+    <input id="room" value="MAIN" maxlength="24">
+    <div class="grid">
+      <a class="btn green" id="tv">TV / plansza</a>
+      <a class="btn" id="player">Telefon gracza</a>
+      <a class="btn orange" id="admin">Panel admina</a>
+    </div>
+    <p class="muted">Przykład: pokój <b>KUBA</b> da linki <code>?room=KUBA</code>.</p>
+  </div>
+  <script>
+    const input = document.getElementById('room');
+    function clean(v){ return String(v||'MAIN').toUpperCase().replace(/[^A-Z0-9_-]/g,'').slice(0,24) || 'MAIN'; }
+    function update(){ const r = clean(input.value); input.value = r; tv.href = `/tv.html?room=${encodeURIComponent(r)}`; player.href = `/player.html?room=${encodeURIComponent(r)}`; admin.href = `/admin.html?room=${encodeURIComponent(r)}`; }
+    input.addEventListener('input', update); update();
+  </script>
+</body>
+</html>

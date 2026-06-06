@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Party Protocol - Gracz</title>
+  <style>
+    *{box-sizing:border-box}body{margin:0;min-height:100vh;background:#0f172a;color:white;font-family:Arial,sans-serif;text-align:center;padding:18px}.card{background:#1e293b;border:1px solid #334155;border-radius:22px;padding:22px;margin:14px 0;box-shadow:0 12px 34px rgba(0,0,0,.25)}h1,h2{margin:10px 0}.blueText{color:#38bdf8}.muted{color:#94a3b8}.timer{font-size:4rem;font-weight:900;color:#f43f5e;font-variant-numeric:tabular-nums}.btn{display:block;width:100%;border:0;border-radius:16px;padding:20px;margin:10px 0;color:white;font-size:1.25rem;font-weight:900;cursor:pointer}.green{background:#10b981}.red{background:#ef4444}.blue{background:#2563eb}.orange{background:#f59e0b}.purple{background:#7c3aed}.gray{background:#334155}input,textarea,select{width:100%;padding:18px;border-radius:14px;border:2px solid #38bdf8;background:#020617;color:white;font-size:1.15rem;margin:10px 0}textarea{min-height:120px;resize:vertical}.row{display:grid;grid-template-columns:1fr 1fr;gap:10px}.pill{display:inline-block;background:#020617;border:1px solid #334155;color:#94a3b8;padding:8px 12px;border-radius:999px;margin:4px}.disabled{opacity:.45;pointer-events:none}.flash{filter:blur(5px);transition:filter .4s}.secret{border:2px dashed #f59e0b;background:#451a03}.small{font-size:.95rem}.score{font-size:1.7rem;color:#10b981;font-weight:900}
+  </style>
+</head>
+<body>
+  <div><span class="pill">Pokój: <b id="roomBadge"></b></span><span class="pill" id="status">łączę...</span></div>
+  <div id="app"></div>
+  <script src="/socket.io/socket.io.js"></script>
+  <script>
+    const params = new URLSearchParams(location.search);
+    const room = (params.get('room') || 'MAIN').toUpperCase().replace(/[^A-Z0-9_-]/g,'') || 'MAIN';
+    document.getElementById('roomBadge').textContent = room;
+    const socket = io({ query: { room, role: 'player' } });
+    let state = null;
+    let joined = localStorage.getItem(`pp-name-${room}`) || '';
+    let secretSeen = localStorage.getItem(`pp-secret-seen-${room}`) === '1';
+    socket.on('connect',()=>document.getElementById('status').textContent='online');
+    socket.on('disconnect',()=>document.getElementById('status').textContent='offline');
+    socket.on('kicked',()=>{ localStorage.removeItem(`pp-name-${room}`); alert('Usunięto Cię z gry przez panel admina.'); location.reload(); });
+    socket.on('updateState', s => { state=s; render(); });
+    socket.on('tick', t => { const el=document.getElementById('timer'); if(el) el.textContent=t>0?t:''; });
+    function esc(x){ return String(x ?? '').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c])); }
+    function me(){ return state?.players?.[socket.id]; }
+    function others(){ return Object.entries(state?.players||{}).filter(([id])=>id!==socket.id); }
+    function timer(){ return `<div id="timer" class="timer">${state.timer||''}</div>`; }
+    function catName(){ const map = {quick:'Szybki Strzał',social:'Sąd Społeczny',open:'Inżynieria i Kalkulacje',globetrotter:'Globtroter',auction:'Licytacja w Dół',timeline:'Historyczna Oś Czasu',illusion:'Iluzja Optyczna',detective:'Detektyw Zbiegowisk',biology:'Biologia i Ciało',debate:'Loża Szyderców',sidequest:'Side Quest',final:'Finał Finałów'}; return map[state.currentCategory] || state.currentCategory || ''; }
+    function render(){
+      if(!state) return;
+      const app=document.getElementById('app');
+      if(!me()) { app.innerHTML=joinHtml(); return; }
+      if(me().flashbangThisRound && state.phase==='round') document.body.classList.add('flash'); else document.body.classList.remove('flash');
+      if(state.paused) { app.innerHTML=`<div class="card"><h1>PAUZA</h1><p>Admin zatrzymał grę.</p>${myFooter()}</div>`; return; }
+      if(state.phase==='lobby') app.innerHTML=`<div class="card"><h1>Jesteś w lobby</h1><p>Czekamy na start na TV.</p>${secretCard()}${myFooter()}</div>`;
+      else if(state.phase==='secret_intro') app.innerHTML=`<div class="card"><h1>Tajny Rozkaz</h1>${secretCard(true)}${myFooter()}</div>`;
+      else if(state.phase==='wheel') app.innerHTML=`<div class="card"><h1>Koło Fortuny</h1>${timer()}<h2>${esc(catName())}</h2><p>Za chwilę pokój taktyczny.</p>${myFooter()}</div>`;
+      else if(state.phase==='tactical') app.innerHTML=tacticalHtml();
+      else if(state.phase==='round') app.innerHTML=roundHtml();
+      else if(state.phase==='story_guess') app.innerHTML=storyGuessHtml();
+      else if(state.phase==='debate_vote') app.innerHTML=pickPlayerHtml('Wybierz najlepszego przeciwnika w dyskusji', 'submitAnswer');
+      else if(state.phase==='auction_verify') app.innerHTML=`<div class="card"><h1>Weryfikacja</h1><p>Patrzcie na TV. Ktoś właśnie walczy o godność.</p>${myFooter()}</div>`;
+      else if(state.phase==='results') app.innerHTML=`<div class="card"><h1>Wyniki rundy</h1>${timer()}<p>Patrz na TV. Tam dzieją się osądy.</p>${myFooter()}</div>`;
+      else if(state.phase==='final_auction') app.innerHTML=finalBidHtml();
+      else if(state.phase==='final_verify') app.innerHTML=`<div class="card"><h1>Finał trwa</h1><p>Weryfikacja na TV.</p>${myFooter()}</div>`;
+      else if(state.phase==='secret_agent_reveal') app.innerHTML=`<div class="card"><h1>Tajni Agenci</h1><p>Grupa rozlicza misje na TV.</p>${secretCard(true)}${myFooter()}</div>`;
+      else if(state.phase==='game_over') app.innerHTML=`<div class="card"><h1>Koniec gry</h1>${myFooter()}</div>`;
+      else app.innerHTML=`<div class="card"><h1>${esc(state.phase)}</h1>${myFooter()}</div>`;
+    }
+    function joinHtml(){ return `<div class="card"><h1>Dołącz do gry</h1><p class="muted">Pokój: ${esc(room)}</p><input id="name" placeholder="Twoje imię" value="${esc(joined)}"><button class="btn green" onclick="joinGame()">WEJDŹ DO GRY</button></div>`; }
+    function joinGame(){ const name=document.getElementById('name').value.trim(); if(!name)return; joined=name; localStorage.setItem(`pp-name-${room}`,name); socket.emit('joinGame',name); }
+    function myFooter(){ const p=me(); return `<div class="card"><div>Ty: <b>${esc(p?.name||'')}</b></div><div class="score">${p?.score||0} pkt</div><div><span class="pill">🔥 ${p?.inventory?.boost??0}</span><span class="pill">🔒 ${p?.inventory?.lock??0}</span><span class="pill">💥 ${p?.inventory?.flashbang??0}</span><span class="pill">🛡️ ${p?.inventory?.shield??0}</span></div></div>`; }
+    function secretCard(force=false){ const p=me(); if(!p?.secretMission) return ''; if(secretSeen && !force) return `<div class="card secret"><b>Tajna misja ukryta.</b><p class="small">Pokaże się znowu na końcu gry.</p><button class="btn orange" onclick="secretSeen=false;render()">Pokaż jeszcze raz</button></div>`; return `<div class="card secret"><h2>Twoja tajna misja</h2><p>${esc(p.secretMission)}</p><button class="btn orange" onclick="localStorage.setItem('pp-secret-seen-${room}','1');secretSeen=true;render()">Zrozumiałem. Ukryj.</button></div>`; }
+    function tacticalHtml(){ const p=me(); return `<div class="card"><h1>Pokój Taktyczny</h1>${timer()}<h2>${esc(catName())}</h2><button class="btn orange ${p.inventory?.boost<=0?'disabled':''}" onclick="useItem('boost')">🔥 BOOST x2 (${p.inventory?.boost??0})</button><button class="btn blue ${p.inventory?.shield<=0?'disabled':''}" onclick="useItem('shield')">🛡️ TARCZA (${p.inventory?.shield??0})</button><h3>Sabotaże</h3>${targetButtons('lock','🔒 Kłódka',p.inventory?.lock)}${targetButtons('flashbang','💥 Flashbang',p.inventory?.flashbang)}${myFooter()}</div>`; }
+    function targetButtons(item,label,count){ if((count??0)<=0) return `<button class="btn gray disabled">${label} (0)</button>`; const opts=others().map(([id,p])=>`<option value="${id}">${esc(p.name)}</option>`).join(''); if(!opts) return `<button class="btn gray disabled">${label}: brak celu</button>`; const selectId=`target-${item}`; return `<div class="card"><b>${label} (${count})</b><select id="${selectId}">${opts}</select><button class="btn purple" onclick="useItem('${item}',document.getElementById('${selectId}').value)">UŻYJ</button></div>`; }
+    function useItem(item,targetId=null){ socket.emit('useItem',{item,targetId}); }
+    function roundHtml(){ const p=me(); if(p.blockedThisRound) return `<div class="card"><h1>🔒 Zablokowany</h1><p>Ktoś odciął Ci telefon. Patrz jak inni zdobywają punkty.</p>${myFooter()}</div>`; if(p.answered && state.currentType!=='auction' && state.currentType!=='debate') return `<div class="card"><h1>Wysłano</h1><p>Patrz na TV.</p>${myFooter()}</div>`; const q=state.currentQuestion||{}; let body=''; if(state.currentType==='abcd') body=(q.options||[]).map(o=>`<button class="btn gray" onclick="sendAnswer('${escAttr(o)}')">${esc(o)}</button>`).join(''); else if(state.currentType==='open') body=`<textarea id="ans" placeholder="Wpisz odpowiedź"></textarea><button class="btn green" onclick="sendAnswer(document.getElementById('ans').value)">WYŚLIJ</button>`; else if(state.currentType==='slider') body=`<input type="range" id="ans" min="${q.min||1800}" max="${q.max||2020}" step="${q.step||10}" value="1960" oninput="out.value=this.value"><output id="out">1960</output><button class="btn green" onclick="sendAnswer(document.getElementById('ans').value)">WYŚLIJ</button>`; else if(state.currentType==='vote') body=pickPlayerButtons('submitVote'); else if(state.currentType==='auction') body=`<h3>Aktualnie: ${state.auction?.lowestBid?.amount||100} pkt</h3><input id="bid" type="number" placeholder="Niższa oferta"><button class="btn green" onclick="sendAnswer(document.getElementById('bid').value)">PRZEBIJ W DÓŁ</button>`; else if(state.currentType==='story') body=`<textarea id="ans" placeholder="Wpisz anonimową historię"></textarea><button class="btn green" onclick="sendAnswer(document.getElementById('ans').value)">WYŚLIJ HISTORIĘ</button>`; else if(state.currentType==='debate') body=`<button class="btn green" onclick="sendAnswer('agree')">ZGADZAM SIĘ</button><button class="btn red" onclick="sendAnswer('disagree')">NIE ZGADZAM SIĘ</button><p class="muted">Po wyborze dyskutujecie na żywo.</p>`; return `<div class="card"><h1>${esc(catName())}</h1>${timer()}<h2>${esc(q.q)}</h2>${body}${myFooter()}</div>`; }
+    function escAttr(x){ return String(x??'').replace(/\\/g,'\\\\').replace(/'/g,"\\'").replace(/\n/g,' '); }
+    function sendAnswer(ans){ if(!ans)return; socket.emit('submitAnswer',ans); }
+    function pickPlayerButtons(eventName){ return others().map(([id,p])=>`<button class="btn gray" onclick="socket.emit('${eventName}','${id}')">${esc(p.name)}</button>`).join('') || '<p>Brak innych graczy.</p>'; }
+    function pickPlayerHtml(title,eventName){ if(me()?.answered) return `<div class="card"><h1>Wysłano</h1><p>Czekamy na resztę.</p>${myFooter()}</div>`; return `<div class="card"><h1>${esc(title)}</h1>${timer()}${pickPlayerButtons(eventName)}${myFooter()}</div>`; }
+    function storyGuessHtml(){ if(me()?.answered) return `<div class="card"><h1>Typ wysłany</h1><p>Czekamy na resztę.</p>${myFooter()}</div>`; const story=state.storyPool?.[state.currentStoryIndex]; return `<div class="card"><h1>Kto to napisał?</h1>${timer()}<p class="card">${esc(story?.text||'')}</p>${pickPlayerButtons('submitAnswer')}${myFooter()}</div>`; }
+    function finalBidHtml(){ const p=me(); return `<div class="card"><h1>Finał Finałów</h1>${timer()}<h2>${esc(state.currentQuestion?.q||'')}</h2><p>Wpisz, ile elementów potrafisz wymienić.</p><input id="finalBid" type="number" placeholder="np. 12"><button class="btn green" onclick="socket.emit('submitFinalBid',document.getElementById('finalBid').value)">DEKLARUJ</button><p class="muted">Najwyższa deklaracja idzie na TV.</p>${myFooter()}</div>`; }
+  </script>
+</body>
+</html>
