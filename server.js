@@ -1,18 +1,21 @@
 const express = require('express');
 const http = require('http');
-const { Server } = require('socket.io');
-const cors = require('cors');
 const path = require('path');
+const cors = require('cors');
+const QRCode = require('qrcode');
+const { Server } = require('socket.io');
 
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*' } });
+const PORT = process.env.PORT || 3000;
 
 app.use(cors());
 app.use(express.json({ limit: '15mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
-const PORT = process.env.PORT || 3000;
+const rooms = new Map();
+const timers = new Map();
 
 const categoryConfig = {
   quick: { name: '1. Szybki Strzał', type: 'abcd', time: 15, points: 100, wheel: true },
@@ -70,14 +73,19 @@ const roasts = {
   sabotage: ['{from} rzuca sabotaż na {to}. Przyjaźń chwilowo zawieszona.', '{to} właśnie dostał prezent od {from}. Prezent jest z kategorii: cierpienie.', '{from} uznał, że {to} ma dziś za łatwo.']
 };
 
-const defaultPlayerInventory = () => ({ boost: 2, lock: 1, flashbang: 1, shield: 1 });
+function cleanRoom(value) {
+  return String(value || 'MAIN').trim().toUpperCase().replace(/[^A-Z0-9_-]/g, '').slice(0, 24) || 'MAIN';
+}
+function defaultPlayerInventory() { return { boost: 2, lock: 1, flashbang: 1, shield: 1 }; }
+function rand(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
+function normalize(value) { return String(value ?? '').trim().toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, ''); }
+function formatLine(template, data) { return template.replace(/\{(\w+)\}/g, (_, k) => data[k] ?? ''); }
 
-let gameState = freshGameState();
-let timerInterval = null;
-
-function freshGameState() {
+function freshGameState(room) {
   return {
+    room,
     phase: 'lobby',
+    paused: false,
     roundNumber: 0,
     maxRounds: 10,
     players: {},
@@ -85,6 +93,7 @@ function freshGameState() {
     currentCategory: null,
     currentQuestion: null,
     currentType: null,
+    forcedNextCategory: null,
     submissions: {},
     votes: {},
     storyPool: [],
@@ -95,14 +104,25 @@ function freshGameState() {
     logs: [],
     usedQuestionIds: [],
     firstCategoryName: null,
-    finalStarted: false
+    finalStarted: false,
+    createdAt: Date.now()
   };
 }
-
-function publicState(forSocketId = null) {
-  const safePlayers = {};
-  Object.entries(gameState.players).forEach(([id, p]) => {
-    safePlayers[id] = {
+function getRoom(roomCode) {
+  const room = cleanRoom(roomCode);
+  if (!rooms.has(room)) rooms.set(room, freshGameState(room));
+  return rooms.get(room);
+}
+function clearRoomTimer(room) {
+  const old = timers.get(room);
+  if (old?.interval) clearInterval(old.interval);
+  timers.delete(room);
+}
+function activePlayerIds(state) { return Object.keys(state.players).filter(id => state.players[id].connected !== false); }
+function safePlayers(state, forSocketId = null, revealSecrets = false) {
+  const players = {};
+  Object.entries(state.players).forEach(([id, p]) => {
+    players[id] = {
       name: p.name,
       score: p.score,
       answered: p.answered,
@@ -110,320 +130,347 @@ function publicState(forSocketId = null) {
       boostActive: p.boostActive,
       blockedThisRound: p.blockedThisRound,
       flashbangThisRound: p.flashbangThisRound,
-      inventory: forSocketId === id ? p.inventory : undefined,
-      secretMission: forSocketId === id ? p.secretMission : undefined
+      shieldActive: p.shieldActive,
+      inventory: forSocketId === id || revealSecrets ? p.inventory : undefined,
+      secretMission: forSocketId === id || revealSecrets ? p.secretMission : undefined,
+      stats: revealSecrets ? p.stats : undefined
     };
   });
-  return { ...gameState, players: safePlayers };
+  return players;
 }
-
-function emitState() {
-  for (const id of Object.keys(gameState.players)) io.to(id).emit('updateState', publicState(id));
-  io.emit('tvState', publicState(null));
+function publicState(state, forSocketId = null, revealSecrets = false) {
+  return { ...state, players: safePlayers(state, forSocketId, revealSecrets) };
 }
-
-function rand(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
-function normalize(value) { return String(value ?? '').trim().toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, ''); }
-function formatLine(template, data) { return template.replace(/\{(\w+)\}/g, (_, k) => data[k] ?? ''); }
-function activePlayerIds() { return Object.keys(gameState.players).filter(id => gameState.players[id].connected); }
-function categoryByName(name) { return Object.entries(categoryConfig).find(([, c]) => c.name === name)?.[0] || null; }
-
-function addRoundMessage(kind, data = {}) {
+function emitRoom(room) {
+  const state = getRoom(room);
+  Object.keys(state.players).forEach(id => io.to(id).emit('updateState', publicState(state, id, false)));
+  io.to(`tv:${room}`).emit('tvState', publicState(state, null, true));
+  io.to(`admin:${room}`).emit('adminState', publicState(state, null, true));
+}
+function addRoundMessage(state, kind, data = {}) {
   const line = formatLine(rand(roasts[kind] || roasts.wrong), data);
-  gameState.tactical.roundMessages.push(line);
-  gameState.logs.push({ at: Date.now(), line });
+  state.tactical.roundMessages.push(line);
+  state.logs.push({ at: Date.now(), line });
   return line;
 }
-
-function resetRoundPlayerFlags() {
-  for (const p of Object.values(gameState.players)) {
+function resetRoundPlayerFlags(state) {
+  Object.values(state.players).forEach(p => {
     p.answered = false;
     p.boostActive = false;
     p.blockedThisRound = false;
     p.flashbangThisRound = false;
     p.shieldActive = false;
+  });
+}
+function chooseCategory(state) {
+  if (state.forcedNextCategory && categoryConfig[state.forcedNextCategory]) {
+    const forced = state.forcedNextCategory;
+    state.forcedNextCategory = null;
+    return forced;
   }
+  return rand(Object.keys(categoryConfig).filter(k => categoryConfig[k].wheel));
 }
-
-function chooseCategory() {
-  const keys = Object.keys(categoryConfig).filter(k => categoryConfig[k].wheel);
-  return rand(keys);
-}
-
-function chooseQuestion(categoryKey) {
-  let pool = questionsDB.filter(q => q.category === categoryKey && !gameState.usedQuestionIds.includes(q.id));
+function chooseQuestion(state, categoryKey) {
+  let pool = questionsDB.filter(q => q.category === categoryKey && !state.usedQuestionIds.includes(q.id));
   if (!pool.length) pool = questionsDB.filter(q => q.category === categoryKey);
-  const q = rand(pool);
-  if (q) gameState.usedQuestionIds.push(q.id);
-  return q || { id: Date.now(), category: categoryKey, q: 'Brak pytania w tej kategorii. Admin musi coś dodać.', options: [], answer: '' };
+  const picked = rand(pool);
+  if (picked) state.usedQuestionIds.push(picked.id);
+  const q = picked ? { ...picked } : { id: Date.now(), category: categoryKey, q: 'Brak pytania w tej kategorii. Dodaj pytanie w panelu admina.', options: [], answer: '' };
+  if (q.answer === '__FIRST_CATEGORY__') q.answer = state.firstCategoryName || '';
+  return q;
 }
-
-function clearTimer() { if (timerInterval) clearInterval(timerInterval); timerInterval = null; }
-
-function startTimer(seconds, onEnd, options = {}) {
-  clearTimer();
-  gameState.timer = seconds;
-  emitState();
-  timerInterval = setInterval(() => {
-    gameState.timer -= 1;
-    io.emit('tick', gameState.timer);
-    if (options.endWhenAllAnswered && allRequiredAnswered()) {
-      clearTimer();
-      onEnd();
+function allRequiredAnswered(state) {
+  const ids = activePlayerIds(state);
+  if (!ids.length) return false;
+  if (['auction', 'debate', 'story'].includes(state.currentType)) return false;
+  return ids.every(id => state.players[id].answered || state.players[id].blockedThisRound);
+}
+function startRoomTimer(room, seconds, onEnd, options = {}) {
+  const state = getRoom(room);
+  clearRoomTimer(room);
+  state.timer = seconds;
+  emitRoom(room);
+  const interval = setInterval(() => {
+    const s = getRoom(room);
+    if (s.paused) return;
+    s.timer -= 1;
+    io.to(room).emit('tick', s.timer);
+    io.to(`tv:${room}`).emit('tick', s.timer);
+    io.to(`admin:${room}`).emit('tick', s.timer);
+    if (options.endWhenAllAnswered && allRequiredAnswered(s)) {
+      clearRoomTimer(room);
+      onEnd(room);
       return;
     }
-    if (gameState.timer <= 0) {
-      clearTimer();
-      onEnd();
+    if (s.timer <= 0) {
+      clearRoomTimer(room);
+      onEnd(room);
     }
   }, 1000);
+  timers.set(room, { interval, onEnd, options });
 }
 
-function allRequiredAnswered() {
-  const ids = activePlayerIds();
-  if (!ids.length) return false;
-  if (['auction', 'debate', 'story'].includes(gameState.currentType)) return false;
-  return ids.every(id => gameState.players[id].answered || gameState.players[id].blockedThisRound);
+function startGame(room) {
+  const state = getRoom(room);
+  if (!['lobby', 'game_over'].includes(state.phase)) return;
+  state.phase = 'secret_intro';
+  state.paused = false;
+  emitRoom(room);
+  startRoomTimer(room, 8, startWheel);
 }
-
-function startGame() {
-  if (gameState.phase !== 'lobby' && gameState.phase !== 'game_over') return;
-  gameState.phase = 'secret_intro';
-  emitState();
-  startTimer(8, startWheel);
+function startWheel(room) {
+  const state = getRoom(room);
+  if (state.roundNumber >= state.maxRounds) return startFinal(room);
+  resetRoundPlayerFlags(state);
+  state.roundNumber += 1;
+  state.phase = 'wheel';
+  state.paused = false;
+  state.submissions = {};
+  state.votes = {};
+  state.storyPool = [];
+  state.currentStoryIndex = 0;
+  state.tactical = { activeSabotages: [], roundMessages: [] };
+  state.auction = { lowestBid: null, winnerSocketId: null };
+  const categoryKey = chooseCategory(state);
+  state.currentCategory = categoryKey;
+  state.currentType = categoryConfig[categoryKey].type;
+  state.currentQuestion = chooseQuestion(state, categoryKey);
+  if (!state.firstCategoryName) state.firstCategoryName = categoryConfig[categoryKey].name;
+  emitRoom(room);
+  startRoomTimer(room, 5, startTactical);
 }
-
-function startWheel() {
-  if (gameState.roundNumber >= gameState.maxRounds) return startFinal();
-  resetRoundPlayerFlags();
-  gameState.roundNumber += 1;
-  gameState.phase = 'wheel';
-  gameState.submissions = {};
-  gameState.votes = {};
-  gameState.storyPool = [];
-  gameState.currentStoryIndex = 0;
-  gameState.tactical = { activeSabotages: [], roundMessages: [] };
-  gameState.auction = { lowestBid: null, winnerSocketId: null };
-
-  const categoryKey = chooseCategory();
-  gameState.currentCategory = categoryKey;
-  gameState.currentType = categoryConfig[categoryKey].type;
-  gameState.currentQuestion = chooseQuestion(categoryKey);
-  if (!gameState.firstCategoryName) gameState.firstCategoryName = categoryConfig[categoryKey].name;
-  if (gameState.currentQuestion.answer === '__FIRST_CATEGORY__') gameState.currentQuestion.answer = gameState.firstCategoryName;
-  emitState();
-  startTimer(5, startTactical);
+function startTactical(room) {
+  const state = getRoom(room);
+  state.phase = 'tactical';
+  emitRoom(room);
+  startRoomTimer(room, 30, startRound);
 }
-
-function startTactical() {
-  gameState.phase = 'tactical';
-  emitState();
-  startTimer(30, startRound);
+function startRound(room) {
+  const state = getRoom(room);
+  state.phase = 'round';
+  const cfg = categoryConfig[state.currentCategory] || { time: 30 };
+  if (state.currentType === 'auction') state.auction.lowestBid = { player: 'Brak licytacji', amount: 100, socketId: null };
+  emitRoom(room);
+  startRoomTimer(room, cfg.time, finishRound, { endWhenAllAnswered: true });
 }
-
-function startRound() {
-  gameState.phase = 'round';
-  const cfg = categoryConfig[gameState.currentCategory];
-  if (gameState.currentType === 'auction') gameState.auction.lowestBid = { player: 'Brak licytacji', amount: 100, socketId: null };
-  emitState();
-  startTimer(cfg.time, finishRound, { endWhenAllAnswered: true });
+function finishRound(room) {
+  const state = getRoom(room);
+  if (state.currentType === 'auction') return startAuctionVerify(room);
+  if (state.currentType === 'story') return startStoryGuessing(room);
+  if (state.currentType === 'debate') return startDebateVoting(room);
+  calculateStandardResults(state);
+  startResults(room);
 }
-
-function finishRound() {
-  const type = gameState.currentType;
-  if (type === 'auction') return startAuctionVerify();
-  if (type === 'story') return startStoryGuessing();
-  if (type === 'debate') return startDebateVoting();
-  calculateStandardResults();
-  startResults();
-}
-
-function calculateStandardResults() {
-  const cfg = categoryConfig[gameState.currentCategory];
-  const ids = activePlayerIds();
-
-  if (gameState.currentType === 'vote') {
+function calculateStandardResults(state) {
+  const cfg = categoryConfig[state.currentCategory] || { points: 100, time: 30 };
+  const ids = activePlayerIds(state);
+  if (state.currentType === 'vote') {
     const counts = {};
-    Object.values(gameState.votes).forEach(targetId => counts[targetId] = (counts[targetId] || 0) + 1);
+    Object.values(state.votes).forEach(targetId => counts[targetId] = (counts[targetId] || 0) + 1);
     const max = Math.max(0, ...Object.values(counts));
     const winners = Object.keys(counts).filter(id => counts[id] === max && max > 0);
-    winners.forEach(id => { if (gameState.players[id]) gameState.players[id].score += cfg.points; });
-    Object.entries(gameState.votes).forEach(([voterId, targetId]) => {
-      if (winners.includes(targetId) && gameState.players[voterId]) gameState.players[voterId].score += Math.floor(cfg.points / 2);
+    winners.forEach(id => { if (state.players[id]) state.players[id].score += cfg.points; });
+    Object.entries(state.votes).forEach(([voterId, targetId]) => {
+      if (winners.includes(targetId) && state.players[voterId]) state.players[voterId].score += Math.floor(cfg.points / 2);
     });
     return;
   }
-
   ids.forEach(id => {
-    const p = gameState.players[id];
-    if (p.blockedThisRound) return addRoundMessage('noAnswer', { name: p.name });
-    const sub = gameState.submissions[id];
-    if (!sub) return addRoundMessage('noAnswer', { name: p.name });
-    let correct = false;
-    if (gameState.currentType === 'slider') {
-      correct = Math.abs(Number(sub.answer) - Number(gameState.currentQuestion.answer)) <= 10;
-    } else {
-      correct = normalize(sub.answer) === normalize(gameState.currentQuestion.answer);
-    }
+    const p = state.players[id];
+    if (p.blockedThisRound) return addRoundMessage(state, 'noAnswer', { name: p.name });
+    const sub = state.submissions[id];
+    if (!sub) return addRoundMessage(state, 'noAnswer', { name: p.name });
+    const correct = state.currentType === 'slider'
+      ? Math.abs(Number(sub.answer) - Number(state.currentQuestion.answer)) <= 10
+      : normalize(sub.answer) === normalize(state.currentQuestion.answer);
     if (correct) {
       const elapsed = Math.max(0, cfg.time - sub.timeLeft);
       let pts = Math.max(Math.floor(cfg.points * 0.4), cfg.points - elapsed * 5);
       if (p.boostActive) pts *= 2;
       p.score += pts;
       p.stats.correct++;
-      gameState.logs.push({ at: Date.now(), line: `${p.name} zdobywa ${pts} pkt.` });
+      state.logs.push({ at: Date.now(), line: `${p.name} zdobywa ${pts} pkt.` });
     } else {
       p.stats.wrong++;
       if (p.boostActive) p.score -= Math.floor(cfg.points / 2);
-      addRoundMessage('wrong', { name: p.name });
+      addRoundMessage(state, 'wrong', { name: p.name });
     }
   });
 }
-
-function startAuctionVerify() {
-  gameState.phase = 'auction_verify';
-  emitState();
+function startAuctionVerify(room) {
+  const state = getRoom(room);
+  state.phase = 'auction_verify';
+  emitRoom(room);
 }
-
-function resolveAuction(success) {
-  const bid = gameState.auction.lowestBid;
-  if (bid?.socketId && gameState.players[bid.socketId]) {
-    const p = gameState.players[bid.socketId];
+function resolveAuction(room, success) {
+  const state = getRoom(room);
+  const bid = state.auction.lowestBid;
+  if (bid?.socketId && state.players[bid.socketId]) {
+    const p = state.players[bid.socketId];
     if (success) p.score += bid.amount;
     else p.score -= bid.amount;
   }
-  startResults();
+  startResults(room);
 }
-
-function startStoryGuessing() {
-  const entries = Object.entries(gameState.submissions).filter(([, s]) => s.answer);
-  gameState.storyPool = entries.map(([authorId, s]) => ({ authorId, text: s.answer }));
-  if (!gameState.storyPool.length) return startResults();
-  gameState.phase = 'story_guess';
-  gameState.votes = {};
-  gameState.currentStoryIndex = 0;
-  emitState();
-  startTimer(20, resolveCurrentStoryGuess, { endWhenAllAnswered: true });
+function startStoryGuessing(room) {
+  const state = getRoom(room);
+  const entries = Object.entries(state.submissions).filter(([, s]) => s.answer);
+  state.storyPool = entries.map(([authorId, s]) => ({ authorId, text: s.answer }));
+  if (!state.storyPool.length) return startResults(room);
+  state.phase = 'story_guess';
+  state.votes = {};
+  state.currentStoryIndex = 0;
+  Object.values(state.players).forEach(p => p.answered = false);
+  emitRoom(room);
+  startRoomTimer(room, 20, resolveCurrentStoryGuess, { endWhenAllAnswered: true });
 }
-
-function resolveCurrentStoryGuess() {
-  const story = gameState.storyPool[gameState.currentStoryIndex];
-  if (!story) return startResults();
-  Object.entries(gameState.votes).forEach(([voterId, guessedAuthor]) => {
-    if (voterId !== story.authorId && guessedAuthor === story.authorId && gameState.players[voterId]) gameState.players[voterId].score += 100;
+function resolveCurrentStoryGuess(room) {
+  const state = getRoom(room);
+  const story = state.storyPool[state.currentStoryIndex];
+  if (!story) return startResults(room);
+  Object.entries(state.votes).forEach(([voterId, guessedAuthor]) => {
+    if (voterId !== story.authorId && guessedAuthor === story.authorId && state.players[voterId]) state.players[voterId].score += 100;
   });
-  if (gameState.players[story.authorId]) {
-    const wrong = Object.values(gameState.votes).filter(v => v !== story.authorId).length;
-    gameState.players[story.authorId].score += wrong * 30;
+  if (state.players[story.authorId]) {
+    const wrong = Object.values(state.votes).filter(v => v !== story.authorId).length;
+    state.players[story.authorId].score += wrong * 30;
   }
-  gameState.currentStoryIndex++;
-  gameState.votes = {};
-  if (gameState.currentStoryIndex >= gameState.storyPool.length) return startResults();
-  emitState();
-  startTimer(20, resolveCurrentStoryGuess, { endWhenAllAnswered: true });
+  state.currentStoryIndex++;
+  state.votes = {};
+  Object.values(state.players).forEach(p => p.answered = false);
+  if (state.currentStoryIndex >= state.storyPool.length) return startResults(room);
+  emitRoom(room);
+  startRoomTimer(room, 20, resolveCurrentStoryGuess, { endWhenAllAnswered: true });
 }
-
-function startDebateVoting() {
-  gameState.phase = 'debate_vote';
-  gameState.votes = {};
-  emitState();
-  startTimer(25, resolveDebateVoting, { endWhenAllAnswered: true });
+function startDebateVoting(room) {
+  const state = getRoom(room);
+  state.phase = 'debate_vote';
+  state.votes = {};
+  Object.values(state.players).forEach(p => p.answered = false);
+  emitRoom(room);
+  startRoomTimer(room, 25, resolveDebateVoting, { endWhenAllAnswered: true });
 }
-
-function resolveDebateVoting() {
-  Object.values(gameState.votes).forEach(targetId => {
-    if (gameState.players[targetId]) gameState.players[targetId].score += categoryConfig[gameState.currentCategory].points;
+function resolveDebateVoting(room) {
+  const state = getRoom(room);
+  Object.values(state.votes).forEach(targetId => {
+    if (state.players[targetId]) state.players[targetId].score += (categoryConfig[state.currentCategory]?.points || 80);
   });
-  startResults();
+  startResults(room);
 }
-
-function startResults() {
-  const sorted = Object.values(gameState.players).sort((a, b) => b.score - a.score);
-  if (sorted[0]) addRoundMessage('leader', { name: sorted[0].name });
-  if (sorted.length > 1) addRoundMessage('last', { name: sorted[sorted.length - 1].name });
-  gameState.phase = 'results';
-  emitState();
-  startTimer(9, () => {
-    if (gameState.roundNumber >= gameState.maxRounds) startFinal();
-    else startWheel();
+function startResults(room) {
+  const state = getRoom(room);
+  const sorted = Object.values(state.players).sort((a, b) => b.score - a.score);
+  if (sorted[0]) addRoundMessage(state, 'leader', { name: sorted[0].name });
+  if (sorted.length > 1) addRoundMessage(state, 'last', { name: sorted[sorted.length - 1].name });
+  state.phase = 'results';
+  emitRoom(room);
+  startRoomTimer(room, 9, () => {
+    const s = getRoom(room);
+    if (s.roundNumber >= s.maxRounds) startFinal(room);
+    else startWheel(room);
   });
 }
-
-function startFinal() {
-  gameState.finalStarted = true;
-  gameState.phase = 'final_auction';
-  gameState.currentCategory = 'final';
-  gameState.currentType = 'final_bid';
-  gameState.currentQuestion = chooseQuestion('final');
-  gameState.finalBid = { leaderId: null, amount: 0 };
-  gameState.submissions = {};
-  resetRoundPlayerFlags();
-  emitState();
-  startTimer(30, startFinalVerify);
+function startFinal(room) {
+  const state = getRoom(room);
+  state.finalStarted = true;
+  state.phase = 'final_auction';
+  state.currentCategory = 'final';
+  state.currentType = 'final_bid';
+  state.currentQuestion = chooseQuestion(state, 'final');
+  state.finalBid = { leaderId: null, amount: 0 };
+  state.submissions = {};
+  resetRoundPlayerFlags(state);
+  emitRoom(room);
+  startRoomTimer(room, 30, startFinalVerify);
 }
-
-function startFinalVerify() {
-  gameState.phase = 'final_verify';
-  emitState();
+function startFinalVerify(room) {
+  const state = getRoom(room);
+  state.phase = 'final_verify';
+  emitRoom(room);
 }
-
-function resolveFinal(success) {
-  const id = gameState.finalBid.leaderId;
-  if (id && gameState.players[id]) {
-    if (success) gameState.players[id].score += 700;
-    else gameState.players[id].score = Math.floor(gameState.players[id].score / 2);
+function resolveFinal(room, success) {
+  const state = getRoom(room);
+  const id = state.finalBid.leaderId;
+  if (id && state.players[id]) {
+    if (success) state.players[id].score += 700;
+    else state.players[id].score = Math.floor(state.players[id].score / 2);
   }
-  startSecretReveal();
+  startSecretReveal(room);
 }
-
-function startSecretReveal() {
-  gameState.phase = 'secret_agent_reveal';
-  gameState.votes = {};
-  emitState();
+function startSecretReveal(room) {
+  const state = getRoom(room);
+  state.phase = 'secret_agent_reveal';
+  state.votes = {};
+  emitRoom(room);
 }
-
-function resolveSecretMission(playerId, success) {
-  if (gameState.players[playerId] && success) gameState.players[playerId].score += 500;
-  emitState();
+function resolveSecretMission(room, playerId, success) {
+  const state = getRoom(room);
+  if (state.players[playerId] && success) state.players[playerId].score += 500;
+  emitRoom(room);
 }
-
-function gameOver() {
-  gameState.phase = 'game_over';
-  emitState();
+function gameOver(room) {
+  const state = getRoom(room);
+  state.phase = 'game_over';
+  emitRoom(room);
 }
-
 function useItem(socket, payload) {
-  const p = gameState.players[socket.id];
-  if (!p || gameState.phase !== 'tactical') return;
+  const room = socket.data.room;
+  const state = getRoom(room);
+  const p = state.players[socket.id];
+  if (!p || state.phase !== 'tactical') return;
   const item = payload?.item;
   const targetId = payload?.targetId;
   if (!p.inventory[item] || p.inventory[item] <= 0) return;
-
   if (item === 'boost') {
     p.inventory.boost--;
     p.boostActive = true;
-    return emitState();
+    return emitRoom(room);
   }
   if (item === 'shield') {
     p.inventory.shield--;
     p.shieldActive = true;
-    return emitState();
+    return emitRoom(room);
   }
-  const target = gameState.players[targetId];
+  const target = state.players[targetId];
   if (!target || targetId === socket.id) return;
   p.inventory[item]--;
   p.stats.sabotagesUsed++;
   if (target.shieldActive) {
     target.shieldActive = false;
-    gameState.tactical.roundMessages.push(`${target.name} odbija sabotaż tarczą. ${p.name} właśnie zmarnował sprzęt.`);
+    state.tactical.roundMessages.push(`${target.name} odbija sabotaż tarczą. ${p.name} właśnie zmarnował sprzęt.`);
   } else if (item === 'lock') {
     target.blockedThisRound = true;
-    addRoundMessage('sabotage', { from: p.name, to: target.name });
+    addRoundMessage(state, 'sabotage', { from: p.name, to: target.name });
   } else if (item === 'flashbang') {
     target.flashbangThisRound = true;
-    addRoundMessage('sabotage', { from: p.name, to: target.name });
+    addRoundMessage(state, 'sabotage', { from: p.name, to: target.name });
   }
-  emitState();
+  emitRoom(room);
+}
+function adminResetRoom(room, keepPlayers = true) {
+  const oldPlayers = getRoom(room).players;
+  clearRoomTimer(room);
+  const fresh = freshGameState(room);
+  if (keepPlayers) {
+    fresh.players = oldPlayers;
+    Object.values(fresh.players).forEach(p => {
+      p.score = 0;
+      p.connected = true;
+      p.answered = false;
+      p.inventory = defaultPlayerInventory();
+      p.secretMission = rand(secretMissions);
+      p.stats = { correct: 0, wrong: 0, sabotagesUsed: 0, timesRoasted: 0 };
+    });
+  }
+  rooms.set(room, fresh);
+  emitRoom(room);
+}
+function adminNextRound(room) {
+  clearRoomTimer(room);
+  const state = getRoom(room);
+  if (state.phase === 'lobby') startGame(room);
+  else if (state.roundNumber >= state.maxRounds) startFinal(room);
+  else startWheel(room);
 }
 
 app.get('/api/config', (req, res) => res.json(categoryConfig));
@@ -437,24 +484,32 @@ app.delete('/api/questions/:id', (req, res) => {
   questionsDB = questionsDB.filter(q => String(q.id) !== String(req.params.id));
   res.json({ success: true });
 });
-app.post('/api/reset', (req, res) => {
-  const oldPlayers = gameState.players;
-  clearTimer();
-  gameState = freshGameState();
-  gameState.players = oldPlayers;
-  Object.values(gameState.players).forEach(p => { p.score = 0; p.inventory = defaultPlayerInventory(); p.secretMission = rand(secretMissions); });
-  emitState();
-  res.json({ success: true });
+app.get('/api/state/:room', (req, res) => res.json(publicState(getRoom(req.params.room), null, true)));
+app.get('/api/qr', async (req, res) => {
+  try {
+    const url = String(req.query.url || '');
+    const svg = await QRCode.toString(url, { type: 'svg', margin: 1, width: 360 });
+    res.setHeader('Content-Type', 'image/svg+xml');
+    res.send(svg);
+  } catch (err) {
+    res.status(500).send('QR error');
+  }
 });
 
 io.on('connection', socket => {
-  socket.emit('updateState', publicState(socket.id));
-  socket.emit('tvState', publicState(null));
+  const room = cleanRoom(socket.handshake.query.room);
+  const role = String(socket.handshake.query.role || 'player');
+  socket.data.room = room;
+  socket.join(room);
+  if (role === 'tv') socket.join(`tv:${room}`);
+  if (role === 'admin') socket.join(`admin:${room}`);
+  const state = getRoom(room);
+  socket.emit(role === 'admin' ? 'adminState' : role === 'tv' ? 'tvState' : 'updateState', publicState(state, socket.id, role !== 'player'));
 
   socket.on('joinGame', playerName => {
     const name = String(playerName || '').trim().slice(0, 24);
     if (!name) return;
-    gameState.players[socket.id] = {
+    state.players[socket.id] = {
       name,
       score: 0,
       connected: true,
@@ -467,72 +522,82 @@ io.on('connection', socket => {
       secretMission: rand(secretMissions),
       stats: { correct: 0, wrong: 0, sabotagesUsed: 0, timesRoasted: 0 }
     };
-    emitState();
+    emitRoom(room);
   });
 
-  socket.on('tvStartGame', startGame);
-  socket.on('adminResetGame', () => { clearTimer(); gameState = freshGameState(); emitState(); });
+  socket.on('tvStartGame', () => startGame(room));
   socket.on('useItem', payload => useItem(socket, payload));
 
   socket.on('submitAnswer', answer => {
-    const p = gameState.players[socket.id];
+    const s = getRoom(room);
+    const p = s.players[socket.id];
     if (!p || p.blockedThisRound) return;
-
-    if (gameState.phase === 'round') {
-      if (gameState.currentType === 'auction') {
+    if (s.phase === 'round') {
+      if (s.currentType === 'auction') {
         const amount = parseInt(answer, 10);
         if (!Number.isFinite(amount) || amount <= 0) return;
-        const current = gameState.auction.lowestBid?.amount ?? 100;
+        const current = s.auction.lowestBid?.amount ?? 100;
         if (amount < current) {
-          gameState.auction.lowestBid = { player: p.name, amount, socketId: socket.id };
-          gameState.auction.winnerSocketId = socket.id;
-          io.emit('auctionUpdate', gameState.auction.lowestBid);
-          emitState();
+          s.auction.lowestBid = { player: p.name, amount, socketId: socket.id };
+          s.auction.winnerSocketId = socket.id;
+          io.to(room).emit('auctionUpdate', s.auction.lowestBid);
+          io.to(`tv:${room}`).emit('auctionUpdate', s.auction.lowestBid);
+          emitRoom(room);
         }
         return;
       }
-      if (gameState.currentType === 'final_bid') return;
-      if (p.answered && gameState.currentType !== 'debate') return;
+      if (p.answered && s.currentType !== 'debate') return;
       p.answered = true;
-      gameState.submissions[socket.id] = { answer, timeLeft: gameState.timer, at: Date.now() };
-      emitState();
+      s.submissions[socket.id] = { answer, timeLeft: s.timer, at: Date.now() };
+      emitRoom(room);
       return;
     }
-
-    if (gameState.phase === 'story_guess' || gameState.phase === 'debate_vote') {
-      gameState.votes[socket.id] = answer;
+    if (s.phase === 'story_guess' || s.phase === 'debate_vote') {
+      s.votes[socket.id] = answer;
       p.answered = true;
-      emitState();
+      emitRoom(room);
     }
   });
-
   socket.on('submitVote', targetId => {
-    if (!gameState.players[socket.id]) return;
-    if (gameState.phase === 'round' && gameState.currentType === 'vote') {
-      gameState.votes[socket.id] = targetId;
-      gameState.players[socket.id].answered = true;
-      emitState();
+    const s = getRoom(room);
+    if (!s.players[socket.id]) return;
+    if (s.phase === 'round' && s.currentType === 'vote') {
+      s.votes[socket.id] = targetId;
+      s.players[socket.id].answered = true;
+      emitRoom(room);
     }
   });
-
   socket.on('submitFinalBid', amount => {
-    if (gameState.phase !== 'final_auction') return;
+    const s = getRoom(room);
+    if (s.phase !== 'final_auction') return;
     const bid = parseInt(amount, 10);
     if (!Number.isFinite(bid) || bid <= 0) return;
-    gameState.submissions[socket.id] = { answer: bid, timeLeft: gameState.timer };
-    if (bid > gameState.finalBid.amount) gameState.finalBid = { leaderId: socket.id, amount: bid };
-    emitState();
+    s.submissions[socket.id] = { answer: bid, timeLeft: s.timer };
+    if (bid > s.finalBid.amount) s.finalBid = { leaderId: socket.id, amount: bid };
+    emitRoom(room);
   });
 
-  socket.on('tvAuctionResult', resolveAuction);
-  socket.on('tvFinalResult', resolveFinal);
-  socket.on('tvSecretResult', ({ playerId, success }) => resolveSecretMission(playerId, success));
-  socket.on('tvGameOver', gameOver);
+  socket.on('tvAuctionResult', success => resolveAuction(room, success));
+  socket.on('tvFinalResult', success => resolveFinal(room, success));
+  socket.on('tvSecretResult', ({ playerId, success }) => resolveSecretMission(room, playerId, success));
+  socket.on('tvGameOver', () => gameOver(room));
+
+  socket.on('adminStartGame', () => startGame(room));
+  socket.on('adminPause', () => { const s = getRoom(room); s.paused = true; emitRoom(room); });
+  socket.on('adminResume', () => { const s = getRoom(room); s.paused = false; emitRoom(room); });
+  socket.on('adminNextRound', () => adminNextRound(room));
+  socket.on('adminResetGame', ({ keepPlayers = true } = {}) => adminResetRoom(room, keepPlayers));
+  socket.on('adminSetMaxRounds', value => { const s = getRoom(room); const n = parseInt(value, 10); if (Number.isFinite(n) && n > 0) s.maxRounds = n; emitRoom(room); });
+  socket.on('adminForceCategory', categoryKey => { const s = getRoom(room); if (categoryConfig[categoryKey]) s.forcedNextCategory = categoryKey; emitRoom(room); });
+  socket.on('adminSetScore', ({ playerId, score }) => { const s = getRoom(room); const n = parseInt(score, 10); if (s.players[playerId] && Number.isFinite(n)) s.players[playerId].score = n; emitRoom(room); });
+  socket.on('adminKickPlayer', playerId => { const s = getRoom(room); if (s.players[playerId]) { delete s.players[playerId]; io.to(playerId).emit('kicked'); } emitRoom(room); });
+  socket.on('adminAddPoints', ({ playerId, delta }) => { const s = getRoom(room); const n = parseInt(delta, 10); if (s.players[playerId] && Number.isFinite(n)) s.players[playerId].score += n; emitRoom(room); });
 
   socket.on('disconnect', () => {
-    if (gameState.players[socket.id]) gameState.players[socket.id].connected = false;
-    emitState();
+    const s = getRoom(room);
+    if (s.players[socket.id]) s.players[socket.id].connected = false;
+    emitRoom(room);
   });
 });
 
-server.listen(PORT, () => console.log(`Party Protocol działa na porcie ${PORT}`));
+server.listen(PORT, () => console.log(`Party Protocol v2.1 działa na porcie ${PORT}`));
