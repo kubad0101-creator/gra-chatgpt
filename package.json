@@ -1,7 +1,7 @@
 {
   "name": "party-protocol",
-  "version": "2.0.0",
-  "description": "Gra imprezowa online na TV i smartfony",
+  "version": "2.1.0",
+  "description": "Party Protocol - gra imprezowa online na TV i smartfony",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
@@ -12,6 +12,7 @@
   "dependencies": {
     "cors": "^2.8.5",
     "express": "^4.18.2",
+    "qrcode": "^1.5.4",
     "socket.io": "^4.7.2"
   }
 }
